@@ -162,6 +162,7 @@ export default function App() {
   const [showWidth, setShowWidth] = useState(false)
   const [showFill, setShowFill] = useState(false)
   const [showLineStyle, setShowLineStyle] = useState(false)
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false)
 
   const [shapeFill, setShapeFill] = useState<boolean>(() => typeof P.shapeFill === 'boolean' ? P.shapeFill : true)
   const [lineStyle, setLineStyle] = useState<LineStyle>(() => P.lineStyle === 'dashed' ? 'dashed' : 'solid')
@@ -686,8 +687,8 @@ export default function App() {
       }
       return true
     })
-    if (nextShapes.length !== shapes.length) changed = true
-    if (changed) { 
+    if (next.length !== strokes.length || nextShapes.length !== shapes.length) changed = true
+    if (changed) {
       pushUndo(pageNum, strokes, shapes)
       setStrokesByPage(s => ({ ...s, [pageNum]: next }))
       setShapesByPage(s => ({ ...s, [pageNum]: nextShapes }))
@@ -718,17 +719,21 @@ export default function App() {
     const curStrokes = strokesByPage[pageNum] ?? []
     const curShapes = shapesByPage[pageNum] ?? []
     if (!curStrokes.length && !curShapes.length) return
-    if (!confirm('Bu sayfadaki tüm çizimler ve şekiller silinsin mi?')) return
-    pushUndo(pageNum, curStrokes, curShapes)
+    setConfirmClearOpen(true)
+  }, [strokesByPage, shapesByPage, pageNum, pushUndo])
+  const doClear = useCallback(() => {
+    pushUndo(pageNum, strokesByPage[pageNum] ?? [], shapesByPage[pageNum] ?? [])
     setStrokesByPage(s => ({ ...s, [pageNum]: [] }))
     setShapesByPage(s => ({ ...s, [pageNum]: [] }))
+    setSelectedShapeId(null)
+    setConfirmClearOpen(false)
   }, [strokesByPage, shapesByPage, pageNum, pushUndo])
 
   const handleSave = useCallback(async () => {
     if (!pdfBytes) return
     setSaving(true)
     try {
-      const { PDFDocument, rgb, pushGraphicsState, popGraphicsState, setDashPattern } = await import('pdf-lib')
+      const { PDFDocument, rgb } = await import('pdf-lib')
       const libDoc = await PDFDocument.load(pdfBytes)
       // save strokes
       for (const [pageKey, strokes] of Object.entries(strokesByPage)) {
@@ -751,7 +756,8 @@ export default function App() {
               let path = `M ${pts[0][0]} ${pts[0][1]}`
               for (let i = 1; i < pts.length; i++) path += ` L ${pts[i][0]} ${pts[i][1]}`
               try {
-                page.drawSvgPath(path, { borderColor: c, borderWidth: lw, borderOpacity: 1, color: undefined, ...dash })
+                // anchor y=ph: kütüphane page_y = ph - svg_y hesaplar → canvas konumuyla birebir
+                page.drawSvgPath(path, { x: 0, y: ph, borderColor: c, borderWidth: lw, borderOpacity: 1, color: undefined, ...dash })
               } catch {
                 for (let i = 0; i < pts.length - 1; i++) page.drawLine({ start: { x: pts[i][0], y: pts[i][1] }, end: { x: pts[i + 1][0], y: pts[i + 1][1] }, thickness: lw, color: c, opacity: 1, ...dash })
               }
@@ -765,7 +771,7 @@ export default function App() {
             const pdfOutline = outline.map(([x, y]) => [x * sx, y * sy] as [number, number])
             const path = getSvgPath(pdfOutline); if (!path) continue
             const v2 = hexToRgbVals(s.color); const c2 = rgb(v2.r, v2.g, v2.b)
-            try { page.drawSvgPath(path, { color: c2, borderColor: c2, borderWidth: 0, opacity: 1 }) } catch {
+            try { page.drawSvgPath(path, { x: 0, y: ph, color: c2, borderColor: c2, borderWidth: 0, opacity: 1 }) } catch {
               for (let i = 0; i < pdfOutline.length - 1; i++) page.drawLine({ start: { x: pdfOutline[i][0], y: ph - pdfOutline[i][1] }, end: { x: pdfOutline[i + 1][0], y: ph - pdfOutline[i + 1][1] }, thickness: 0.5, color: c2 })
             }
           }
@@ -780,59 +786,54 @@ export default function App() {
           const v = hexToRgbVals(s.color)
           const c = rgb(v.r, v.g, v.b)
           const lw = Math.max(1, s.width * (pw / viewportW.current || 1) * 0.6)
+          // yüksek seviye metotlar kendi dash state'ini sıfırladığı için dash'i opsiyon olarak ver
+          const dash = s.lineStyle === 'dashed' ? { borderDashArray: [6, 4], borderDashPhase: 0 } : {}
           const x1 = s.start.x * pw, y1 = ph - s.start.y * ph
           const x2 = s.end.x * pw, y2 = ph - s.end.y * ph
           const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2
           const rx = Math.abs(x2 - x1) / 2, ry = Math.abs(y1 - y2) / 2
 
-          if (s.lineStyle === 'dashed') {
-            page.pushOperators(pushGraphicsState(), setDashPattern([6, 4], 0))
-          }
-
-          try {
-            if (s.type === 'rectangle') {
-              const x = Math.min(x1, x2), y = Math.min(y1, y2)
-              const wRect = Math.abs(x2 - x1), hRect = Math.abs(y2 - y1)
-              page.drawRectangle({
-                x, y, width: wRect, height: hRect,
-                color: s.fill ? c : undefined,
-                borderColor: c, borderWidth: lw,
-                opacity: s.fill ? 0.3 : 1, borderOpacity: 1,
-              })
-            } else if (s.type === 'ellipse') {
-              page.drawEllipse({
-                x: cx, y: cy, xScale: rx, yScale: ry,
-                color: s.fill ? c : undefined,
-                borderColor: c, borderWidth: lw,
-                opacity: s.fill ? 0.3 : 1, borderOpacity: 1,
-              })
+          if (s.type === 'rectangle') {
+            const x = Math.min(x1, x2), y = Math.min(y1, y2)
+            page.drawRectangle({
+              x, y, width: Math.abs(x2 - x1), height: Math.abs(y2 - y1),
+              color: s.fill ? c : undefined,
+              borderColor: c, borderWidth: lw,
+              opacity: s.fill ? 0.3 : 1, borderOpacity: 1,
+              ...dash,
+            })
+          } else if (s.type === 'ellipse') {
+            page.drawEllipse({
+              x: cx, y: cy, xScale: rx, yScale: ry,
+              color: s.fill ? c : undefined,
+              borderColor: c, borderWidth: lw,
+              opacity: s.fill ? 0.3 : 1, borderOpacity: 1,
+              ...dash,
+            })
             } else if (s.type === 'triangle') {
               const left = Math.min(x1, x2), right = Math.max(x1, x2)
               const top = Math.min(y1, y2), bottom = Math.max(y1, y2)
-              // drawSvgPath kendi y-flip'ini yapar → canvas koordinatını olduğu gibi ver (apex üstte kalır)
+              // anchor y=ph + kütüphane flip'i = canvas konumu; apex üstte kalır
               const path = `M ${(left + right) / 2} ${top} L ${right} ${bottom} L ${left} ${bottom} Z`
               page.drawSvgPath(path, {
+                x: 0, y: ph,
                 borderColor: c, borderWidth: lw,
                 color: s.fill ? c : undefined,
                 opacity: s.fill ? 0.3 : 0,
                 borderOpacity: 1,
+                ...dash,
               })
             } else if (s.type === 'arrow') {
               const angle = Math.atan2(y1 - y2, x2 - x1)
               const headLen = Math.max(lw * 4, 15)
-              page.drawLine({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, thickness: lw, color: c, opacity: 1 })
+              page.drawLine({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 }, thickness: lw, color: c, opacity: 1, ...dash })
               const hx1 = x2 - headLen * Math.cos(angle - Math.PI / 6)
               const hy1 = y2 + headLen * Math.sin(angle - Math.PI / 6)
               const hx2 = x2 - headLen * Math.cos(angle + Math.PI / 6)
               const hy2 = y2 + headLen * Math.sin(angle + Math.PI / 6)
-              page.drawLine({ start: { x: x2, y: y2 }, end: { x: hx1, y: hy1 }, thickness: lw, color: c, opacity: 1 })
-              page.drawLine({ start: { x: x2, y: y2 }, end: { x: hx2, y: hy2 }, thickness: lw, color: c, opacity: 1 })
+              page.drawLine({ start: { x: x2, y: y2 }, end: { x: hx1, y: hy1 }, thickness: lw, color: c, opacity: 1, ...dash })
+              page.drawLine({ start: { x: x2, y: y2 }, end: { x: hx2, y: hy2 }, thickness: lw, color: c, opacity: 1, ...dash })
             }
-          } finally {
-            if (s.lineStyle === 'dashed') {
-              page.pushOperators(popGraphicsState())
-            }
-          }
         }
       }
       const out = await libDoc.save()
@@ -1220,6 +1221,25 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* Temizle onay modalı */}
+      {confirmClearOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.55)' }} onClick={() => setConfirmClearOpen(false)}>
+          <div className="w-[320px] rounded-2xl border p-5 shadow-2xl" style={{ background: '#151a23', borderColor: '#232a3b' }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-3">
+              <span className="w-9 h-9 rounded-full flex items-center justify-center shrink-0" style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}><Trash2 size={16} strokeWidth={2} /></span>
+              <div>
+                <div className="text-[14px] font-semibold text-white">Sayfa temizlensin mi?</div>
+                <div className="text-[12px]" style={{ color: '#8a909e' }}>Bu sayfadaki tüm çizimler ve şekiller silinecek.</div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 mt-4">
+              <button onClick={() => setConfirmClearOpen(false)} className="h-8 px-3.5 rounded-lg border text-[13px] font-medium transition-colors" style={{ background: 'transparent', borderColor: '#232a3b', color: '#8a909e' }}>Vazgeç</button>
+              <button onClick={doClear} className="h-8 px-3.5 rounded-lg border text-[13px] font-semibold text-white" style={{ background: '#ef4444', borderColor: '#ef4444' }}>Temizle</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="py-2 text-center text-[11px] border-t shrink-0" style={{ borderColor:'var(--border)', color:'var(--text-muted)', background:'var(--bg-card)' }}>
         B/P Kalem • E Silgi • Ctrl+Z/Y • Delete son çizim • Ctrl+S İndir • Ctrl+0 / +/- • Ctrl+Scroll zoom

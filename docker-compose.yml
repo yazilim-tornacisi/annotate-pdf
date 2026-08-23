@@ -1,8 +1,8 @@
 services:
-  pdf-draw:
+  annotate-pdf:
     build: .
-    image: pdf-cizim:latest
-    container_name: pdf-cizim
+    image: annotate-pdf:latest
+    container_name: annotate-pdf
     ports:
       - "3003:80"
     restart: unless-stopped

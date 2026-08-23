@@ -1,4 +1,4 @@
-# PDF Çizim — Hafif ve Performanslı PDF İşaretleme
+# Annotate PDF
 
 Vite + React + TypeScript ile geliştirilmiş, tamamen tarayıcı içinde çalışan PDF çizim uygulaması. Backend yok, veriniz cihazdan çıkmaz.
 
@@ -40,13 +40,13 @@ docker compose up --build -d
 # http://localhost:3003
 ```
 
-`run.sh` eski `pdf-cizim` container'ını temizleyip `docker compose up --build -d` çalıştırır.
+`run.sh` eski `annotate-pdf` container'ını temizleyip `docker compose up --build -d` çalıştırır.
 
 ### Docker Manuel
 
 ```bash
-docker build -t pdf-cizim .
-docker run -d --name pdf-cizim -p 3003:80 pdf-cizim
+docker build -t annotate-pdf .
+docker run -d --name annotate-pdf -p 3003:80 annotate-pdf
 ```
 
 Image multi-stage build kullanır: `node:22-alpine` ile derlenir, `nginx:alpine` ile servis edilir (≈ 50 MB civarı final image, nginx gzip açık).
