@@ -61,6 +61,27 @@ function savePrefs(p: Prefs) {
   } catch { /* kota dolu vb. — sessizce yut */ }
 }
 
+// ham PDF baytları içinde ascii desen ara (Encrypt false-positive tespiti için)
+function bytesContain(buf: ArrayBuffer, needle: string): boolean {
+  const bytes = new Uint8Array(buf)
+  const n = needle.length
+  let i = 0
+  const CH = 65536
+  // taşmayı önlemek için parça parça tara
+  while (i < bytes.length) {
+    const end = Math.min(bytes.length, i + CH)
+    for (let j = i; j + n <= end; j++) {
+      let ok = true
+      for (let k = 0; k < n; k++) {
+        if (bytes[j + k] !== needle.charCodeAt(k)) { ok = false; break }
+      }
+      if (ok) return true
+    }
+    i = end - n + 1 // desen parça sınırını aşmasın diye geri sar
+  }
+  return false
+}
+
 function hexToRgbVals(hex: string) {
   return {
     r: parseInt(hex.slice(1, 3), 16) / 255,
@@ -734,7 +755,7 @@ export default function App() {
     setSaving(true)
     try {
       const { PDFDocument, rgb } = await import('pdf-lib')
-      let libDoc: Awaited<ReturnType<typeof PDFDocument.load>>
+      let libDoc: Awaited<ReturnType<typeof PDFDocument.load>> | null = null
 
       // 1) normal yol: orijinali vektör olarak aç
       try {
@@ -742,23 +763,35 @@ export default function App() {
       } catch (err) {
         if (!/encrypted/i.test(String((err as Error)?.message))) throw err
 
-        // 2) şifreli PDF: pdf.js decrypt edebildiği için sayfaları görselleştir,
+        // 2) pdf-lib'in bilinen yanlış-pozitifi: dosya şifreli olmayabilir.
+        //    Ham baytlarda gerçekten /Encrypt sözlüğü var mı diye bak;
+        //    yoksa sadece parser yanılgısıdır → ignoreEncryption ile vektör aç.
+        const hasEncryptDict = bytesContain(pdfBytes, '/Encrypt')
+        if (!hasEncryptDict) {
+          try {
+            libDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true })
+          } catch { /* raster fallback'e düş */ }
+        }
+
+        // 3) gerçekten şifreli: pdf.js decrypt edebildiği için sayfaları görselleştir,
         //    yeni bir PDF kur ve açıklamaları üstüne vektör olarak bas
-        libDoc = await PDFDocument.create()
-        const RENDER_SCALE = 2
-        for (let i = 1; i <= totalPages; i++) {
-          const p = await pdfDoc.getPage(i)
-          const base = p.getViewport({ scale: 1 })
-          const vp = p.getViewport({ scale: RENDER_SCALE })
-          const c = document.createElement('canvas')
-          c.width = Math.round(vp.width); c.height = Math.round(vp.height)
-          const c2d = c.getContext('2d', { alpha: false })!
-          c2d.fillStyle = '#ffffff'; c2d.fillRect(0, 0, c.width, c.height)
-          await p.render({ canvasContext: c2d as unknown as CanvasRenderingContext2D, viewport: vp } as never).promise
-          const img = await libDoc.embedJpg(c.toDataURL('image/jpeg', 0.85))
-          const np = libDoc.addPage([base.width, base.height])
-          np.drawImage(img, { x: 0, y: 0, width: base.width, height: base.height })
-          c.width = 0; c.height = 0 // bellek: ara canvas'ı hemen serbest bırak
+        if (!libDoc) {
+          libDoc = await PDFDocument.create()
+          const RENDER_SCALE = 2
+          for (let i = 1; i <= totalPages; i++) {
+            const p = await pdfDoc.getPage(i)
+            const base = p.getViewport({ scale: 1 })
+            const vp = p.getViewport({ scale: RENDER_SCALE })
+            const c = document.createElement('canvas')
+            c.width = Math.round(vp.width); c.height = Math.round(vp.height)
+            const c2d = c.getContext('2d', { alpha: false })!
+            c2d.fillStyle = '#ffffff'; c2d.fillRect(0, 0, c.width, c.height)
+            await p.render({ canvasContext: c2d as unknown as CanvasRenderingContext2D, viewport: vp } as never).promise
+            const img = await libDoc.embedJpg(c.toDataURL('image/jpeg', 0.85))
+            const np = libDoc.addPage([base.width, base.height])
+            np.drawImage(img, { x: 0, y: 0, width: base.width, height: base.height })
+            c.width = 0; c.height = 0 // bellek: ara canvas'ı hemen serbest bırak
+          }
         }
       }
 
@@ -866,6 +899,7 @@ export default function App() {
         }
       }
       }
+      if (!libDoc) throw new Error('PDF açılamadı')
       applyAnnotations(libDoc)
 
       const out = await libDoc.save()
