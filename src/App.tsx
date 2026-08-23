@@ -730,15 +730,44 @@ export default function App() {
   }, [strokesByPage, shapesByPage, pageNum, pushUndo])
 
   const handleSave = useCallback(async () => {
-    if (!pdfBytes) return
+    if (!pdfBytes || !pdfDoc) return
     setSaving(true)
     try {
       const { PDFDocument, rgb } = await import('pdf-lib')
-      const libDoc = await PDFDocument.load(pdfBytes)
+      let libDoc: Awaited<ReturnType<typeof PDFDocument.load>>
+
+      // 1) normal yol: orijinali vektör olarak aç
+      try {
+        libDoc = await PDFDocument.load(pdfBytes)
+      } catch (err) {
+        if (!/encrypted/i.test(String((err as Error)?.message))) throw err
+
+        // 2) şifreli PDF: pdf.js decrypt edebildiği için sayfaları görselleştir,
+        //    yeni bir PDF kur ve açıklamaları üstüne vektör olarak bas
+        libDoc = await PDFDocument.create()
+        const RENDER_SCALE = 2
+        for (let i = 1; i <= totalPages; i++) {
+          const p = await pdfDoc.getPage(i)
+          const base = p.getViewport({ scale: 1 })
+          const vp = p.getViewport({ scale: RENDER_SCALE })
+          const c = document.createElement('canvas')
+          c.width = Math.round(vp.width); c.height = Math.round(vp.height)
+          const c2d = c.getContext('2d', { alpha: false })!
+          c2d.fillStyle = '#ffffff'; c2d.fillRect(0, 0, c.width, c.height)
+          await p.render({ canvasContext: c2d as unknown as CanvasRenderingContext2D, viewport: vp } as never).promise
+          const img = await libDoc.embedJpg(c.toDataURL('image/jpeg', 0.85))
+          const np = libDoc.addPage([base.width, base.height])
+          np.drawImage(img, { x: 0, y: 0, width: base.width, height: base.height })
+          c.width = 0; c.height = 0 // bellek: ara canvas'ı hemen serbest bırak
+        }
+      }
+
+      // açıklamaları (strokes + shapes) hedef belgeye uygula — her iki yolda da aynı kod
+      const applyAnnotations = (doc: Awaited<ReturnType<typeof PDFDocument.load>>) => {
       // save strokes
       for (const [pageKey, strokes] of Object.entries(strokesByPage)) {
         const pn = Number(pageKey); if (!strokes.length) continue
-        const page = libDoc.getPage(pn - 1)
+        const page = doc.getPage(pn - 1)
         const { width: pw, height: ph } = page.getSize()
         for (const s of strokes) {
           const v = hexToRgbVals(s.color)
@@ -780,7 +809,7 @@ export default function App() {
       // save shapes
       for (const [pageKey, shapes] of Object.entries(shapesByPage)) {
         const pn = Number(pageKey); if (!shapes.length) continue
-        const page = libDoc.getPage(pn - 1)
+        const page = doc.getPage(pn - 1)
         const { width: pw, height: ph } = page.getSize()
         for (const s of shapes) {
           const v = hexToRgbVals(s.color)
@@ -836,6 +865,9 @@ export default function App() {
             }
         }
       }
+      }
+      applyAnnotations(libDoc)
+
       const out = await libDoc.save()
       const blob = new Blob([out as unknown as BlobPart], { type: 'application/pdf' })
       const url = URL.createObjectURL(blob)
