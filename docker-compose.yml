@@ -1,0 +1,8 @@
+services:
+  pdf-draw:
+    build: .
+    image: pdf-cizim:latest
+    container_name: pdf-cizim
+    ports:
+      - "3003:80"
+    restart: unless-stopped
