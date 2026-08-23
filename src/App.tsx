@@ -45,6 +45,22 @@ type Shape = {
 const COLORS = ['#000000', '#ef4444', '#2563eb', '#16a34a', '#eab308', '#9333ea', '#ff6900', '#14b8a6', '#f97316', '#a855f7']
 // kalınlık artık slider 0.5-10, sabit WIDTHS kaldırıldı
 
+// --- kalıcı tercihler (localStorage) ---
+const PREFS_KEY = 'annotate-pdf:prefs'
+const UNDO_LIMIT = 40 // bellek üst sınırı: sayfa başına maks. geri alma adımı
+
+type Prefs = { tool?: string; color?: string; width?: number; shapeFill?: boolean; lineStyle?: string; theme?: string; scale?: number }
+
+function loadPrefs(): Prefs {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') as Prefs } catch { return {} }
+}
+function savePrefs(p: Prefs) {
+  try {
+    const prev = loadPrefs()
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ ...prev, ...p }))
+  } catch { /* kota dolu vb. — sessizce yut */ }
+}
+
 function hexToRgbVals(hex: string) {
   return {
     r: parseInt(hex.slice(1, 3), 16) / 255,
@@ -116,19 +132,24 @@ function ThumbItem({ pageNum, pdfDoc, isActive, onClick }: { pageNum: number; pd
 }
 
 export default function App() {
+  // kalıcı tercihler (bir kez okunur)
+  const prefsRef = useRef<Prefs>(loadPrefs())
+  const P = prefsRef.current
+
   const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null)
   const [pdfDoc, setPdfDoc] = useState<pdfjs.PDFDocumentProxy | null>(null)
   const [pageNum, setPageNum] = useState(1)
   const [totalPages, setTotalPages] = useState(0)
   const [fileName, setFileName] = useState('document.pdf')
   const [loading, setLoading] = useState(false)
-  const [scale, setScale] = useState(1.35)
+  const [scale, setScale] = useState<number>(() => (typeof P.scale === 'number' && P.scale >= 0.6 && P.scale <= 4 ? P.scale : 1.35))
   const viewportW = useRef(0)
   const viewportH = useRef(0)
 
-  const [tool, setTool] = useState<'pen' | 'eraser' | 'dashed-pen' | 'select' | ShapeType>('pen')
-  const [color, setColor] = useState('#000000')
-  const [width, setWidth] = useState(4)
+  const VALID_TOOLS = ['pen','eraser','dashed-pen','select','rectangle','ellipse','triangle','arrow'] as const
+  const [tool, setTool] = useState<(typeof VALID_TOOLS)[number]>(() => (VALID_TOOLS as readonly string[]).includes(P.tool || '') ? P.tool as (typeof VALID_TOOLS)[number] : 'pen')
+  const [color, setColor] = useState(() => /^#[0-9a-fA-F]{6}$/.test(P.color || '') ? P.color! : '#000000')
+  const [width, setWidth] = useState<number>(() => (typeof P.width === 'number' && P.width >= 0.5 && P.width <= 10 ? P.width : 4))
   const [strokesByPage, setStrokesByPage] = useState<Record<number, Stroke[]>>({})
   const [shapesByPage, setShapesByPage] = useState<Record<number, Shape[]>>({})
   const [undoStacks, setUndoStacks] = useState<Record<number, { strokes: Stroke[]; shapes: Shape[] }[]>>({})
@@ -142,8 +163,8 @@ export default function App() {
   const [showFill, setShowFill] = useState(false)
   const [showLineStyle, setShowLineStyle] = useState(false)
 
-  const [shapeFill, setShapeFill] = useState(true)
-  const [lineStyle, setLineStyle] = useState<LineStyle>('solid')
+  const [shapeFill, setShapeFill] = useState<boolean>(() => typeof P.shapeFill === 'boolean' ? P.shapeFill : true)
+  const [lineStyle, setLineStyle] = useState<LineStyle>(() => P.lineStyle === 'dashed' ? 'dashed' : 'solid')
 
   // şekil seçim / taşıma
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null)
@@ -177,10 +198,17 @@ export default function App() {
   const ITEM_H = 132
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (P.theme === 'dark') return 'dark'
+    if (P.theme === 'light') return 'light'
     if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark'
     return 'light'
   })
   useEffect(() => { document.documentElement.setAttribute('data-theme', theme) }, [theme])
+
+  // tercihleri kalıcılaştır (değişen alanları birleştirerek yaz)
+  useEffect(() => {
+    savePrefs({ tool, color, width, shapeFill, lineStyle, theme, scale })
+  }, [tool, color, width, shapeFill, lineStyle, theme, scale])
 
   const canUndo = (undoStacks[pageNum]?.length ?? 0) > 0
   const canRedo = (redoStacks[pageNum]?.length ?? 0) > 0
@@ -317,7 +345,11 @@ export default function App() {
   }
 
   const pushUndo = useCallback((page: number, prevStrokes: Stroke[], prevShapes: Shape[] = []) => {
-    setUndoStacks(s => ({ ...s, [page]: [...(s[page] ?? []), { strokes: prevStrokes, shapes: prevShapes }] }))
+    setUndoStacks(s => {
+      const stack = [...(s[page] ?? []), { strokes: prevStrokes, shapes: prevShapes }]
+      // bellek üst sınırı: en eski snapshot'ları at
+      return { ...s, [page]: stack.length > UNDO_LIMIT ? stack.slice(stack.length - UNDO_LIMIT) : stack }
+    })
     setRedoStacks(s => ({ ...s, [page]: [] }))
   }, [])
 
@@ -715,7 +747,7 @@ export default function App() {
               page.drawLine({ start: { x: a.x * pw, y: ph - a.y * ph }, end: { x: b.x * pw, y: ph - b.y * ph }, thickness: lw, color: c, opacity: 1, ...dash })
             } else {
               // kesikli serbest yol: noktaları polyline path olarak göm
-              const pts = s.points.map(p => [p.x * pw, ph - p.y * ph] as [number, number])
+              const pts = s.points.map(p => [p.x * pw, p.y * ph] as [number, number])
               let path = `M ${pts[0][0]} ${pts[0][1]}`
               for (let i = 1; i < pts.length; i++) path += ` L ${pts[i][0]} ${pts[i][1]}`
               try {
@@ -728,12 +760,13 @@ export default function App() {
             const input = s.points.map(p => ({ x: p.x * viewportW.current, y: p.y * viewportH.current, pressure: p.pressure }))
             const outline = getStroke(input as never, { size: s.width * 2, thinning: 0.5, smoothing: 0.5, streamline: 0.5 }) as unknown as number[][]
             if (!outline.length) continue
+            // drawSvgPath kendi y-flip'ini yapıyor → canvas koordinatını aynen ver (çift flip yasak!)
             const sx = pw / (viewportW.current || pw), sy = ph / (viewportH.current || ph)
-            const pdfOutline = outline.map(([x, y]) => [x * sx, ph - y * sy] as [number, number])
+            const pdfOutline = outline.map(([x, y]) => [x * sx, y * sy] as [number, number])
             const path = getSvgPath(pdfOutline); if (!path) continue
             const v2 = hexToRgbVals(s.color); const c2 = rgb(v2.r, v2.g, v2.b)
             try { page.drawSvgPath(path, { color: c2, borderColor: c2, borderWidth: 0, opacity: 1 }) } catch {
-              for (let i = 0; i < pdfOutline.length - 1; i++) page.drawLine({ start: { x: pdfOutline[i][0], y: pdfOutline[i][1] }, end: { x: pdfOutline[i + 1][0], y: pdfOutline[i + 1][1] }, thickness: 0.5, color: c2 })
+              for (let i = 0; i < pdfOutline.length - 1; i++) page.drawLine({ start: { x: pdfOutline[i][0], y: ph - pdfOutline[i][1] }, end: { x: pdfOutline[i + 1][0], y: ph - pdfOutline[i + 1][1] }, thickness: 0.5, color: c2 })
             }
           }
         }
@@ -776,9 +809,8 @@ export default function App() {
             } else if (s.type === 'triangle') {
               const left = Math.min(x1, x2), right = Math.max(x1, x2)
               const top = Math.min(y1, y2), bottom = Math.max(y1, y2)
-              // svg uzayı (y-down): drawSvgPath kendi flip'ini yapar
-              const sy = (py: number) => ph - py
-              const path = `M ${(left + right) / 2} ${sy(top)} L ${right} ${sy(bottom)} L ${left} ${sy(bottom)} Z`
+              // drawSvgPath kendi y-flip'ini yapar → canvas koordinatını olduğu gibi ver (apex üstte kalır)
+              const path = `M ${(left + right) / 2} ${top} L ${right} ${bottom} L ${left} ${bottom} Z`
               page.drawSvgPath(path, {
                 borderColor: c, borderWidth: lw,
                 color: s.fill ? c : undefined,
@@ -834,7 +866,7 @@ export default function App() {
   const commitZoom = useCallback((raw: string) => {
     const n = parseInt(raw.replace('%',''), 10)
     if (Number.isNaN(n)) { setZoomEditing(false); return }
-    const clamped = Math.max(60, Math.min(280, n))
+    const clamped = Math.max(60, Math.min(400, n))
     setScale(clamped/100); setZoomEditing(false)
   }, [])
 
@@ -845,7 +877,7 @@ export default function App() {
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault()
         const dir = e.deltaY < 0 ? 1 : -1
-        setScale(s => { const ns = Math.round((s + dir*0.08)*100)/100; return Math.max(0.6, Math.min(2.8, ns)) })
+        setScale(s => { const ns = Math.round((s + dir*0.08)*100)/100; return Math.max(0.6, Math.min(4, ns)) })
       }
     }
     el.addEventListener('wheel', onWheel, { passive: false })
@@ -900,7 +932,7 @@ export default function App() {
         }
         return
       }
-      if (!mod && (e.key === '+' || e.key === '=')) { e.preventDefault(); setScale(s=>Math.min(2.8, Math.round((s+0.12)*100)/100)); return }
+      if (!mod && (e.key === '+' || e.key === '=')) { e.preventDefault(); setScale(s=>Math.min(4, Math.round((s+0.12)*100)/100)); return }
       if (!mod && (e.key === '-' || e.key === '_')) { e.preventDefault(); setScale(s=>Math.max(0.6, Math.round((s-0.12)*100)/100)); return }
     }
     window.addEventListener('keydown', h)
@@ -1077,7 +1109,7 @@ export default function App() {
           ) : (
             <button onClick={()=>{ setZoomInput(String(Math.round(scale*100))); setZoomEditing(true)}} className="h-7 min-w-[56px] px-1.5 rounded-lg border text-xs font-medium hover:bg-[#1a1f2b] transition-colors" style={{ background:'#0a0e14', borderColor:'#1e232e', color: '#e5e7eb' }} title="Zoom">{Math.round(scale*100)}%</button>
           )}
-          <button title="Yakınlaştır" onClick={()=>setScale(s=>Math.min(2.8,Math.round((s+0.12)*100)/100))} className="w-8 h-8 rounded-lg flex items-center justify-center border border-transparent text-[#8a909e] hover:bg-[#1a1f2b] hover:text-[#e5e7eb] hover:border-[#1e232e] transition-colors"><ZoomIn size={16} strokeWidth={1.7} /></button>
+          <button title="Yakınlaştır" onClick={()=>setScale(s=>Math.min(4,Math.round((s+0.12)*100)/100))} className="w-8 h-8 rounded-lg flex items-center justify-center border border-transparent text-[#8a909e] hover:bg-[#1a1f2b] hover:text-[#e5e7eb] hover:border-[#1e232e] transition-colors"><ZoomIn size={16} strokeWidth={1.7} /></button>
         </div>
         {/* 12 İndir */}
         <button title="İndir (Ctrl+S)" onClick={handleSave} disabled={!pdfDoc || saving || totalStrokes===0} className="w-8 h-8 rounded-lg flex items-center justify-center border transition-colors shrink-0 hover:bg-[#1a1f2b] hover:border-[#1e232e] disabled:opacity-30 disabled:pointer-events-none" style={tBtn(false, !pdfDoc || saving || totalStrokes===0)}><Download size={16} strokeWidth={1.7} /></button>
