@@ -97,7 +97,7 @@ function getSvgPath(stroke: number[][]) {
   return d
 }
 
-import { FolderOpen, Pencil, Eraser, Palette, SlidersHorizontal, Undo2, Redo2, Trash2, PanelLeft, ZoomIn, ZoomOut, Download, Sun, Moon, ChevronLeft, ChevronRight, Square, Circle, Triangle, ArrowRight, Minus, SquareDashed, MousePointer2 } from 'lucide-react'
+import { FolderOpen, Pencil, Eraser, Palette, SlidersHorizontal, Undo2, Redo2, Trash2, PanelLeft, ZoomIn, ZoomOut, Download, Sun, Moon, ChevronLeft, ChevronRight, Square, Circle, Triangle, ArrowRight, Minus, SquareDashed, MousePointer2, ImageDown, Image, Crop } from 'lucide-react'
 
 /* ---------- thumbnail item (low quality, cached) ---------- */
 function ThumbItem({ pageNum, pdfDoc, isActive, onClick }: { pageNum: number; pdfDoc: pdfjs.PDFDocumentProxy; isActive: boolean; onClick: () => void }) {
@@ -192,6 +192,11 @@ export default function App() {
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null)
   const dragShapeRef = useRef<{ id: string; start: Point; end: Point } | null>(null)
   const dragGrabRef = useRef<{ px: number; py: number; s0: Point; e0: Point } | null>(null)
+
+  // PNG dışa aktarma (sayfa / bölge)
+  const [imageMenuOpen, setImageMenuOpen] = useState(false)
+  const [regionMode, setRegionMode] = useState(false)
+  const regionRectRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
 
   const [pageEditing, setPageEditing] = useState(false)
   const [pageInput, setPageInput] = useState('')
@@ -375,16 +380,8 @@ export default function App() {
     setRedoStacks(s => ({ ...s, [page]: [] }))
   }, [])
 
-  const drawOverlay = useCallback(() => {
-    const canvas = drawCanvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    const dpr = window.devicePixelRatio || 1
-    const w = viewportW.current, h = viewportH.current
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, w, h)
-
+  // kaydedilmiş strokes + shapes'i herhangi bir ctx'e çizer (ekran overlay + PNG export ortak)
+  const paintAnnotations = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number) => {
     // draw strokes
     const strokes = strokesByPage[pageNum] ?? []
     for (const s of strokes) {
@@ -418,14 +415,46 @@ export default function App() {
       drawShape(ctx, dragged, w, h, false)
     }
 
+  }, [strokesByPage, shapesByPage, pageNum])
+
+  const drawOverlay = useCallback(() => {
+    const canvas = drawCanvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const dpr = window.devicePixelRatio || 1
+    const w = viewportW.current, h = viewportH.current
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, w, h)
+    paintAnnotations(ctx, w, h)
+
     // preview current shape being drawn
     const preview = shapePreviewRef.current
     if (preview && preview.page === pageNum) {
       drawShape(ctx, preview, w, h, true)
     }
 
+    // PNG bölge seçimi: dışını karart, kesikli çerçeve çiz
+    if (regionMode && regionRectRef.current) {
+      const r = regionRectRef.current
+      const l = Math.min(r.x0, r.x1) * w, t = Math.min(r.y0, r.y1) * h
+      const rw = Math.abs(r.x1 - r.x0) * w, rh = Math.abs(r.y1 - r.y0) * h
+      ctx.save()
+      ctx.fillStyle = 'rgba(15,17,21,0.45)'
+      ctx.beginPath()
+      ctx.rect(0, 0, w, h)
+      ctx.rect(l, t, rw, rh)
+      ctx.fill('evenodd')
+      ctx.strokeStyle = '#3b82f6'
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([5, 4])
+      ctx.strokeRect(l, t, rw, rh)
+      ctx.restore()
+    }
+
     // selection highlight (Figma tarzı: kesikli çerçeve + köşe tutamaçları)
     if (selectedShapeId && !isDrawingRef.current) {
+      const shapes = shapesByPage[pageNum] ?? []
       const sel = dragShapeRef.current?.id === selectedShapeId && dragShapeRef.current
         ? shapes.find(s => s.id === selectedShapeId)
         : shapes.find(s => s.id === selectedShapeId)
@@ -484,7 +513,7 @@ export default function App() {
       ctx.beginPath(); ctx.strokeStyle = 'rgba(239,68,68,0.9)'; ctx.lineWidth = 1.5; ctx.fillStyle = 'rgba(239,68,68,0.15)'
       ctx.arc(last.x * w, last.y * h, width * 3, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
     }
-  }, [strokesByPage, shapesByPage, pageNum, color, width, tool, shapeFill, lineStyle, selectedShapeId])
+  }, [strokesByPage, shapesByPage, pageNum, color, width, tool, shapeFill, lineStyle, selectedShapeId, regionMode])
 
   useEffect(() => { drawOverlay() }, [drawOverlay, strokesByPage, shapesByPage])
 
@@ -515,6 +544,12 @@ export default function App() {
     ;(e.target as Element).setPointerCapture(e.pointerId)
     isDrawingRef.current = true
     const p = getPos(e)
+
+    // PNG bölge seçim modu — diğer tüm araçların önünde
+    if (regionMode) {
+      regionRectRef.current = { x0: p.x, y0: p.y, x1: p.x, y1: p.y }
+      drawOverlay(); e.preventDefault(); return
+    }
 
     const isShapeTool = tool === 'rectangle' || tool === 'ellipse' || tool === 'triangle' || tool === 'arrow'
 
@@ -562,6 +597,14 @@ export default function App() {
     
     const isShapeTool = tool === 'rectangle' || tool === 'ellipse' || tool === 'triangle' || tool === 'arrow'
     
+    // bölge rect'i canlı güncelle
+    if (regionMode) {
+      const r = regionRectRef.current
+      if (r) { r.x1 = p.x; r.y1 = p.y }
+      drawOverlay()
+      return
+    }
+
     // seçili şekli taşı
     if (tool === 'select') {
       const g = dragGrabRef.current
@@ -611,6 +654,20 @@ export default function App() {
   const handlePointerUp = () => {
     if (!isDrawingRef.current) return
     isDrawingRef.current = false
+
+    // bölge seçimi tamamla → PNG indir
+    if (regionMode) {
+      const r = regionRectRef.current
+      regionRectRef.current = null
+      isDrawingRef.current = false
+      if (r && Math.abs(r.x1 - r.x0) > 0.01 && Math.abs(r.y1 - r.y0) > 0.01) {
+        exportRegionPng(r)
+      } else {
+        drawOverlay()
+      }
+      setRegionMode(false)
+      return
+    }
 
     // taşıma commit: sürüklenen şekli yeni konumuyla kalıcılaştır
     if (tool === 'select') {
@@ -911,6 +968,61 @@ export default function App() {
 
   const totalStrokes = Object.values(strokesByPage).reduce((a, b) => a + b.length, 0)
 
+  // ---------- PNG dışa aktarma (sayfa / bölge) ----------
+  // sayfayı pdf.js ile yüksek çözünürlükte render edip açıklamaları üstüne basar
+  const buildExportCanvas = useCallback(async (): Promise<HTMLCanvasElement> => {
+    if (!pdfDoc) throw new Error('PDF yok')
+    const page = await pdfDoc.getPage(pageNum)
+    const base = page.getViewport({ scale: 1 })
+    // uzun kenarı ~2200px'e getiren ölçek (1.5–3x arası) → kaliteli ama bellek dostu
+    const target = Math.min(3, Math.max(1.5, 2200 / Math.max(base.width, base.height)))
+    const vp = page.getViewport({ scale: target })
+    const c = document.createElement('canvas')
+    c.width = Math.round(vp.width); c.height = Math.round(vp.height)
+    const ctx = c.getContext('2d', { alpha: false })
+    if (!ctx) throw new Error('canvas yok')
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height)
+    await page.render({ canvasContext: ctx as unknown as CanvasRenderingContext2D, viewport: vp } as never).promise
+    paintAnnotations(ctx, c.width, c.height)
+    return c
+  }, [pdfDoc, pageNum, paintAnnotations])
+
+  const downloadCanvasPng = (c: HTMLCanvasElement, name: string) => {
+    c.toBlob(b => {
+      if (!b) return
+      const url = URL.createObjectURL(b)
+      const a = document.createElement('a'); a.href = url; a.download = name; a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }, 'image/png')
+  }
+
+  const exportPagePng = useCallback(async () => {
+    if (!pdfDoc) return
+    setSaving(true)
+    try {
+      const c = await buildExportCanvas()
+      downloadCanvasPng(c, `${fileName.replace(/\.pdf$/i, '')}-sayfa${pageNum}.png`)
+    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
+    finally { setSaving(false) }
+  }, [buildExportCanvas, fileName, pageNum])
+
+  const exportRegionPng = useCallback(async (r: { x0: number; y0: number; x1: number; y1: number }) => {
+    if (!pdfDoc) return
+    setSaving(true)
+    try {
+      const full = await buildExportCanvas()
+      const l = Math.min(r.x0, r.x1) * full.width
+      const t = Math.min(r.y0, r.y1) * full.height
+      const rw = Math.max(1, Math.round(Math.abs(r.x1 - r.x0) * full.width))
+      const rh = Math.max(1, Math.round(Math.abs(r.y1 - r.y0) * full.height))
+      const crop = document.createElement('canvas')
+      crop.width = rw; crop.height = rh
+      crop.getContext('2d')!.drawImage(full, Math.round(l), Math.round(t), rw, rh, 0, 0, rw, rh)
+      downloadCanvasPng(crop, `${fileName.replace(/\.pdf$/i, '')}-sayfa${pageNum}-bolum.png`)
+    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
+    finally { setSaving(false) }
+  }, [buildExportCanvas, fileName, pageNum])
+
   useEffect(() => { if (pageEditing) pageInputRef.current?.focus() }, [pageEditing])
   useEffect(() => { if (zoomEditing) zoomInputRef.current?.focus() }, [zoomEditing])
   useEffect(() => { if (!pageEditing) setPageInput(String(pageNum)) }, [pageNum, pageEditing])
@@ -973,7 +1085,11 @@ export default function App() {
       if (!mod && key === 'o') { setTool('ellipse'); return }
       if (!mod && key === 't') { setTool('triangle'); return }
       if (!mod && key === 'a') { setTool('arrow'); return }
-      if (!mod && e.key === 'Escape') { setSelectedShapeId(null); drawOverlay(); return }
+      if (!mod && e.key === 'Escape') {
+        setSelectedShapeId(null)
+        if (regionMode) { setRegionMode(false); regionRectRef.current = null }
+        drawOverlay(); return
+      }
       if (!mod && (e.key === 'Delete' || e.key === 'Backspace')) {
         const curStrokes = strokesByPage[pageNum] ?? []
         const curShapes = shapesByPage[pageNum] ?? []
@@ -1004,7 +1120,7 @@ export default function App() {
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [undo, redo, pdfDoc, totalStrokes, saving, handleSave, pageNum, strokesByPage, shapesByPage, pushUndo, selectedShapeId])
+  }, [undo, redo, pdfDoc, totalStrokes, saving, handleSave, pageNum, strokesByPage, shapesByPage, pushUndo, selectedShapeId, regionMode])
 
   // click outside to close popovers
   useEffect(() => {
@@ -1178,6 +1294,25 @@ export default function App() {
           )}
           <button title="Yakınlaştır" onClick={()=>setScale(s=>Math.min(4,Math.round((s+0.12)*100)/100))} className="w-8 h-8 rounded-lg flex items-center justify-center border border-transparent text-[#8a909e] hover:bg-[#1a1f2b] hover:text-[#e5e7eb] hover:border-[#1e232e] transition-colors"><ZoomIn size={16} strokeWidth={1.7} /></button>
         </div>
+        {/* 11b PNG dışa aktar */}
+        <div className="relative shrink-0" data-popover>
+          <button title="Görsel olarak indir" onClick={()=>setImageMenuOpen(v=>!v)} className="w-8 h-8 rounded-lg flex items-center justify-center border transition-colors hover:bg-[#1a1f2b] hover:border-[#1e232e]" style={tBtn(imageMenuOpen || regionMode)} data-trigger>
+            <ImageDown size={16} strokeWidth={1.7} />
+          </button>
+          {imageMenuOpen && (
+            <div className="absolute left-0 top-[40px] p-2 rounded-xl border shadow-xl flex flex-col gap-1 z-40" style={{ background:'#151a23', borderColor:'#232a3b', minWidth: 190 }}>
+              <button onClick={()=>{setImageMenuOpen(false); exportPagePng()}} disabled={!pdfDoc} className="h-8 rounded-lg flex items-center gap-2.5 px-2.5 border text-[12px] font-medium transition-colors disabled:opacity-40" style={popRow(false)}>
+                <Image size={14} strokeWidth={2} />
+                <span>Sayfa (PNG)</span>
+              </button>
+              <button onClick={()=>{setImageMenuOpen(false); setRegionMode(true); regionRectRef.current = null}} disabled={!pdfDoc} className="h-8 rounded-lg flex items-center gap-2.5 px-2.5 border text-[12px] font-medium transition-colors disabled:opacity-40" style={popRow(false)}>
+                <Crop size={14} strokeWidth={2} />
+                <span>Bölüm seç (PNG)</span>
+              </button>
+              <div className="text-[10px] px-2 pt-1" style={{ color:'#6b7280' }}>Açıklamalar dahil, yüksek çözünürlük</div>
+            </div>
+          )}
+        </div>
         {/* 12 İndir */}
         <button title="İndir (Ctrl+S)" onClick={handleSave} disabled={!pdfDoc || saving || totalStrokes===0} className="w-8 h-8 rounded-lg flex items-center justify-center border transition-colors shrink-0 hover:bg-[#1a1f2b] hover:border-[#1e232e] disabled:opacity-30 disabled:pointer-events-none" style={tBtn(false, !pdfDoc || saving || totalStrokes===0)}><Download size={16} strokeWidth={1.7} /></button>
         {/* 13 Tema */}
@@ -1265,12 +1400,17 @@ export default function App() {
                 <canvas
                   ref={drawCanvasRef}
                   className="absolute inset-0 touch-none"
-                  style={{ cursor: tool === 'select' ? 'grab' : tool === 'pen' || tool === 'dashed-pen' ? 'crosshair' : 'cell' }}
+                  style={{ cursor: regionMode ? 'crosshair' : tool === 'select' ? 'grab' : tool === 'pen' || tool === 'dashed-pen' ? 'crosshair' : 'cell' }}
                   onPointerDown={handlePointerDown}
                   onPointerMove={handlePointerMove}
                   onPointerUp={handlePointerUp}
                   onPointerLeave={handlePointerUp}
                 />
+                {regionMode && (
+                  <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full text-[11px] font-medium border shadow-md flex items-center gap-2" style={{ background:'#151a23', borderColor:'#232a3b', color:'#e5e7eb', backdropFilter:'blur(6px)' }}>
+                    <Crop size={12} strokeWidth={2} /> Bölgeyi sürükleyerek seç — <b>Esc</b> iptal
+                  </div>
+                )}
               </div>
             )}
 
