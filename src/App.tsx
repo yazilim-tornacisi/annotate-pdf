@@ -198,6 +198,16 @@ export default function App() {
   const [regionMode, setRegionMode] = useState(false)
   const regionRectRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
 
+  // görsel dışa aktarma önizlemesi
+  type ExportJob = { kind: 'page' | 'region'; rect?: { x0: number; y0: number; x1: number; y1: number }; canvas: HTMLCanvasElement; url: string; scale: number }
+  const [exportJob, setExportJob] = useState<ExportJob | null>(null)
+  const [exportBusy, setExportBusy] = useState(false)
+  const [exportFmt, setExportFmt] = useState<'png' | 'jpeg'>('png')
+  const [copiedFlash, setCopiedFlash] = useState(false)
+  const exportBusyRef = useRef(false)
+  const exportScaleRef = useRef(2)
+  useEffect(() => { exportBusyRef.current = exportBusy }, [exportBusy])
+
   const [pageEditing, setPageEditing] = useState(false)
   const [pageInput, setPageInput] = useState('')
   const pageInputRef = useRef<HTMLInputElement>(null)
@@ -661,7 +671,7 @@ export default function App() {
       regionRectRef.current = null
       isDrawingRef.current = false
       if (r && Math.abs(r.x1 - r.x0) > 0.01 && Math.abs(r.y1 - r.y0) > 0.01) {
-        exportRegionPng(r)
+        openImageExport('region', r)
       } else {
         drawOverlay()
       }
@@ -968,14 +978,10 @@ export default function App() {
 
   const totalStrokes = Object.values(strokesByPage).reduce((a, b) => a + b.length, 0)
 
-  // ---------- PNG dışa aktarma (sayfa / bölge) ----------
-  // sayfayı pdf.js ile yüksek çözünürlükte render edip açıklamaları üstüne basar
-  const buildExportCanvas = useCallback(async (): Promise<HTMLCanvasElement> => {
+  // ---------- Görsel dışa aktarma (önizleme + çözünürlük + panoya) ----------
+  const renderPageCanvas = useCallback(async (target: number): Promise<HTMLCanvasElement> => {
     if (!pdfDoc) throw new Error('PDF yok')
     const page = await pdfDoc.getPage(pageNum)
-    const base = page.getViewport({ scale: 1 })
-    // uzun kenarı ~2200px'e getiren ölçek (1.5–3x arası) → kaliteli ama bellek dostu
-    const target = Math.min(3, Math.max(1.5, 2200 / Math.max(base.width, base.height)))
     const vp = page.getViewport({ scale: target })
     const c = document.createElement('canvas')
     c.width = Math.round(vp.width); c.height = Math.round(vp.height)
@@ -987,41 +993,65 @@ export default function App() {
     return c
   }, [pdfDoc, pageNum, paintAnnotations])
 
-  const downloadCanvasPng = (c: HTMLCanvasElement, name: string) => {
-    c.toBlob(b => {
+  const cropCanvas = (full: HTMLCanvasElement, r: { x0: number; y0: number; x1: number; y1: number }): HTMLCanvasElement => {
+    const l = Math.round(Math.min(r.x0, r.x1) * full.width)
+    const t = Math.round(Math.min(r.y0, r.y1) * full.height)
+    const rw = Math.max(1, Math.round(Math.abs(r.x1 - r.x0) * full.width))
+    const rh = Math.max(1, Math.round(Math.abs(r.y1 - r.y0) * full.height))
+    const crop = document.createElement('canvas')
+    crop.width = rw; crop.height = rh
+    crop.getContext('2d')!.drawImage(full, l, t, rw, rh, 0, 0, rw, rh)
+    return crop
+  }
+
+  // önizleme modalını verilen ölçekte kurar
+  const openImageExport = useCallback(async (kind: 'page' | 'region', rect?: { x0: number; y0: number; x1: number; y1: number }) => {
+    if (!pdfDoc || exportBusyRef.current) return
+    setExportBusy(true)
+    try {
+      const scale = exportScaleRef.current
+      let c = await renderPageCanvas(scale)
+      if (kind === 'region' && rect) c = cropCanvas(c, rect)
+      setExportJob({ kind, rect, canvas: c, url: c.toDataURL('image/png'), scale })
+    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
+    finally { setExportBusy(false) }
+  }, [pdfDoc, renderPageCanvas])
+
+  const rebuildExport = useCallback(async (scale: number) => {
+    const job = exportJob
+    if (!job || exportBusyRef.current) return
+    setExportBusy(true)
+    try {
+      exportScaleRef.current = scale
+      let c = await renderPageCanvas(scale)
+      if (job.kind === 'region' && job.rect) c = cropCanvas(c, job.rect)
+      setExportJob({ ...job, canvas: c, url: c.toDataURL('image/png'), scale })
+    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
+    finally { setExportBusy(false) }
+  }, [exportJob, renderPageCanvas])
+
+  const downloadExport = useCallback(() => {
+    const job = exportJob; if (!job) return
+    const ext = exportFmt === 'png' ? 'png' : 'jpg'
+    const name = `${fileName.replace(/\.pdf$/i, '')}-sayfa${pageNum}${job.kind === 'region' ? '-bolum' : ''}.${ext}`
+    job.canvas.toBlob(b => {
       if (!b) return
       const url = URL.createObjectURL(b)
       const a = document.createElement('a'); a.href = url; a.download = name; a.click()
       setTimeout(() => URL.revokeObjectURL(url), 1000)
-    }, 'image/png')
-  }
+    }, exportFmt === 'png' ? 'image/png' : 'image/jpeg', 0.92)
+  }, [exportJob, exportFmt, fileName, pageNum])
 
-  const exportPagePng = useCallback(async () => {
-    if (!pdfDoc) return
-    setSaving(true)
+  const copyExportToClipboard = useCallback(async () => {
+    const job = exportJob; if (!job) return
     try {
-      const c = await buildExportCanvas()
-      downloadCanvasPng(c, `${fileName.replace(/\.pdf$/i, '')}-sayfa${pageNum}.png`)
-    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
-    finally { setSaving(false) }
-  }, [buildExportCanvas, fileName, pageNum])
-
-  const exportRegionPng = useCallback(async (r: { x0: number; y0: number; x1: number; y1: number }) => {
-    if (!pdfDoc) return
-    setSaving(true)
-    try {
-      const full = await buildExportCanvas()
-      const l = Math.min(r.x0, r.x1) * full.width
-      const t = Math.min(r.y0, r.y1) * full.height
-      const rw = Math.max(1, Math.round(Math.abs(r.x1 - r.x0) * full.width))
-      const rh = Math.max(1, Math.round(Math.abs(r.y1 - r.y0) * full.height))
-      const crop = document.createElement('canvas')
-      crop.width = rw; crop.height = rh
-      crop.getContext('2d')!.drawImage(full, Math.round(l), Math.round(t), rw, rh, 0, 0, rw, rh)
-      downloadCanvasPng(crop, `${fileName.replace(/\.pdf$/i, '')}-sayfa${pageNum}-bolum.png`)
-    } catch (e) { console.error(e); alert('Görsel oluşturulamadı: ' + (e as Error).message) }
-    finally { setSaving(false) }
-  }, [buildExportCanvas, fileName, pageNum])
+      if (!navigator.clipboard || typeof ClipboardItem === 'undefined') throw new Error('desteklenmiyor')
+      const blob = await new Promise<Blob | null>(res => job.canvas.toBlob(res, 'image/png'))
+      if (!blob) throw new Error('blob yok')
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+      setCopiedFlash(true); setTimeout(() => setCopiedFlash(false), 1600)
+    } catch (e) { console.error(e); alert('Panoya kopyalanamadı — tarayıcı bu özelliği desteklemiyor olabilir.') }
+  }, [exportJob])
 
   useEffect(() => { if (pageEditing) pageInputRef.current?.focus() }, [pageEditing])
   useEffect(() => { if (zoomEditing) zoomInputRef.current?.focus() }, [zoomEditing])
@@ -1086,6 +1116,7 @@ export default function App() {
       if (!mod && key === 't') { setTool('triangle'); return }
       if (!mod && key === 'a') { setTool('arrow'); return }
       if (!mod && e.key === 'Escape') {
+        if (exportJob) { setExportJob(null); return }
         setSelectedShapeId(null)
         if (regionMode) { setRegionMode(false); regionRectRef.current = null }
         drawOverlay(); return
@@ -1120,7 +1151,7 @@ export default function App() {
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [undo, redo, pdfDoc, totalStrokes, saving, handleSave, pageNum, strokesByPage, shapesByPage, pushUndo, selectedShapeId, regionMode])
+  }, [undo, redo, pdfDoc, totalStrokes, saving, handleSave, pageNum, strokesByPage, shapesByPage, pushUndo, selectedShapeId, regionMode, exportJob])
 
   // click outside to close popovers
   useEffect(() => {
@@ -1301,7 +1332,7 @@ export default function App() {
           </button>
           {imageMenuOpen && (
             <div className="absolute left-0 top-[40px] p-2 rounded-xl border shadow-xl flex flex-col gap-1 z-40" style={{ background:'#151a23', borderColor:'#232a3b', minWidth: 190 }}>
-              <button onClick={()=>{setImageMenuOpen(false); exportPagePng()}} disabled={!pdfDoc} className="h-8 rounded-lg flex items-center gap-2.5 px-2.5 border text-[12px] font-medium transition-colors disabled:opacity-40" style={popRow(false)}>
+              <button onClick={()=>{setImageMenuOpen(false); openImageExport('page')}} disabled={!pdfDoc} className="h-8 rounded-lg flex items-center gap-2.5 px-2.5 border text-[12px] font-medium transition-colors disabled:opacity-40" style={popRow(false)}>
                 <Image size={14} strokeWidth={2} />
                 <span>Sayfa (PNG)</span>
               </button>
@@ -1442,6 +1473,52 @@ export default function App() {
             <div className="flex justify-end gap-2 mt-4">
               <button onClick={() => setConfirmClearOpen(false)} className="h-8 px-3.5 rounded-lg border text-[13px] font-medium transition-colors" style={{ background: 'transparent', borderColor: '#232a3b', color: '#8a909e' }}>Vazgeç</button>
               <button onClick={doClear} className="h-8 px-3.5 rounded-lg border text-[13px] font-semibold text-white" style={{ background: '#ef4444', borderColor: '#ef4444' }}>Temizle</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Görsel dışa aktarma önizlemesi */}
+      {exportJob && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => setExportJob(null)}>
+          <div className="w-full max-w-[560px] rounded-2xl border shadow-2xl" style={{ background: '#151a23', borderColor: '#232a3b' }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 pt-4">
+              <div className="text-[14px] font-semibold text-white">
+                {exportJob.kind === 'page' ? `Sayfa ${pageNum} — PNG/JPEG` : `Bölüm — Sayfa ${pageNum}`}
+              </div>
+              {copiedFlash && <span className="text-[11px] font-medium px-2 py-1 rounded-full" style={{ background:'rgba(22,163,74,0.15)', color:'#4ade80' }}>Panoya kopyalandı ✓</span>}
+            </div>
+
+            <div className="mx-5 mt-3 rounded-xl border overflow-hidden flex items-center justify-center relative" style={{ borderColor:'#232a3b', background:'repeating-conic-gradient(#1e232e 0% 25%, #151a23 0% 50%) 50%/16px 16px', minHeight:180, maxHeight:'46vh' }}>
+              <img src={exportJob.url} alt="önizleme" className="max-w-full max-h-[46vh] object-contain" draggable={false} />
+              {exportBusy && (
+                <div className="absolute inset-0 flex items-center justify-center text-[12px] font-medium" style={{ background:'rgba(10,14,20,0.6)', color:'#e5e7eb' }}>Hazırlanıyor…</div>
+              )}
+            </div>
+
+            <div className="px-5 mt-3 flex items-center gap-2 flex-wrap">
+              <span className="text-[11px]" style={{ color:'#8a909e' }}>Çözünürlük</span>
+              <div className="flex items-center gap-0.5 p-0.5 rounded-lg border" style={{ background:'#0f1115', borderColor:'#232a3b' }}>
+                {[1, 2, 3, 4].map(sc => (
+                  <button key={sc} onClick={()=>rebuildExport(sc)} disabled={exportBusy} className="h-7 w-9 rounded-md text-[11px] font-semibold transition-colors disabled:opacity-40" style={{ background: exportJob.scale===sc ? '#242a38' : 'transparent', color: exportJob.scale===sc ? '#e5e7eb' : '#8a909e', border:`1px solid ${exportJob.scale===sc ? '#2e3447' : 'transparent'}` }}>{sc}×</button>
+                ))}
+              </div>
+              <div className="flex items-center gap-0.5 p-0.5 rounded-lg border ml-auto" style={{ background:'#0f1115', borderColor:'#232a3b' }}>
+                {(['png','jpeg'] as const).map(f => (
+                  <button key={f} onClick={()=>setExportFmt(f)} className="h-7 px-2.5 rounded-md text-[11px] font-semibold uppercase transition-colors" style={{ background: exportFmt===f ? '#242a38' : 'transparent', color: exportFmt===f ? '#e5e7eb' : '#8a909e', border:`1px solid ${exportFmt===f ? '#2e3447' : 'transparent'}` }}>{f}</button>
+                ))}
+              </div>
+              <span className="text-[11px] font-mono" style={{ color:'#8a909e' }}>{exportJob.canvas.width}×{exportJob.canvas.height}</span>
+            </div>
+
+            <div className="flex justify-end gap-2 p-5 pt-4">
+              <button onClick={() => setExportJob(null)} className="h-8 px-3.5 rounded-lg border text-[13px] font-medium transition-colors" style={{ background:'transparent', borderColor:'#232a3b', color:'#8a909e' }}>Vazgeç</button>
+              <button onClick={copyExportToClipboard} disabled={exportBusy || exportFmt!=='png'} title={exportFmt!=='png' ? 'Panoya kopyalama yalnızca PNG formatında çalışır' : 'PNG olarak panoya kopyala'} className="h-8 px-3.5 rounded-lg border text-[13px] font-semibold transition-colors disabled:opacity-40 inline-flex items-center gap-1.5" style={{ background:'#242a38', borderColor:'#2e3447', color:'#e5e7eb' }}>
+                ⧉ Panoya Kopyala
+              </button>
+              <button onClick={downloadExport} disabled={exportBusy} className="h-8 px-3.5 rounded-lg text-[13px] font-semibold text-white transition-colors disabled:opacity-40 inline-flex items-center gap-1.5 border" style={{ background:'#2563eb', borderColor:'#2563eb' }}>
+                İndir
+              </button>
             </div>
           </div>
         </div>
